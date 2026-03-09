@@ -1,0 +1,193 @@
+diff --git a/src/ipa/libipa/camera_sensor_helper.cpp b/src/ipa/libipa/camera_sensor_helper.cpp
+index 7c66cd57..ed7a300b 100644
+--- a/src/ipa/libipa/camera_sensor_helper.cpp
++++ b/src/ipa/libipa/camera_sensor_helper.cpp
+@@ -623,6 +623,16 @@ public:
+ };
+ REGISTER_CAMERA_SENSOR_HELPER("ov2685", CameraSensorHelperOv2685)
+ 
++class CameraSensorHelperOv01a10 : public CameraSensorHelper
++{
++public:
++	CameraSensorHelperOv01a10()
++	{
++		gain_ = AnalogueGainLinear{ 1, 0, 0, 256 };
++	}
++};
++REGISTER_CAMERA_SENSOR_HELPER("ov01a10", CameraSensorHelperOv01a10)
++
+ class CameraSensorHelperOv2740 : public CameraSensorHelper
+ {
+ public:
+diff --git a/src/ipa/simple/algorithms/agc.cpp b/src/ipa/simple/algorithms/agc.cpp
+index c46bb0eb..61d2f449 100644
+--- a/src/ipa/simple/algorithms/agc.cpp
++++ b/src/ipa/simple/algorithms/agc.cpp
+@@ -35,7 +35,7 @@ static constexpr float kExposureOptimal = kExposureBinsCount / 2.0;
+  * It is small enough to have the exposure close to the optimal, and is big
+  * enough to prevent the exposure from wobbling around the optimal value.
+  */
+-static constexpr float kExposureSatisfactory = 0.2;
++static constexpr float kExposureSatisfactory = 0.9;
+ 
+ Agc::Agc()
+ {
+@@ -47,7 +47,7 @@ void Agc::updateExposure(IPAContext &context, IPAFrameContext &frameContext, dou
+ 	 * kExpDenominator of 10 gives ~10% increment/decrement;
+ 	 * kExpDenominator of 5 - about ~20%
+ 	 */
+-	static constexpr uint8_t kExpDenominator = 10;
++	static constexpr uint8_t kExpDenominator = 80;
+ 	static constexpr uint8_t kExpNumeratorUp = kExpDenominator + 1;
+ 	static constexpr uint8_t kExpNumeratorDown = kExpDenominator - 1;
+ 
+@@ -129,10 +129,18 @@ void Agc::process(IPAContext &context,
+ 		exposureBins[idx] += histogram[blackLevelHistIdx + i];
+ 	}
+ 
++	/*
++	 * Weight the brightest bin more heavily to penalise blown-out
++	 * highlights. This pulls exposure down in high-contrast scenes
++	 * (e.g. backlit by a window) without affecting normally-lit ones
++	 * where the top bin is near-empty.
++	 */
++	static constexpr float kHighlightWeight = 3.0;
+ 	for (unsigned int i = 0; i < kExposureBinsCount; i++) {
+ 		LOG(IPASoftExposure, Debug) << i << ": " << exposureBins[i];
+-		denom += exposureBins[i];
+-		num += exposureBins[i] * (i + 1);
++		float weight = (i == kExposureBinsCount - 1) ? kHighlightWeight : 1.0;
++		denom += exposureBins[i] * weight;
++		num += exposureBins[i] * (i + 1) * weight;
+ 	}
+ 
+ 	float exposureMSV = (denom == 0 ? 0 : static_cast<float>(num) / denom);
+diff --git a/src/ipa/simple/algorithms/lut.cpp b/src/ipa/simple/algorithms/lut.cpp
+index e8638f27..ac8e1e7f 100644
+--- a/src/ipa/simple/algorithms/lut.cpp
++++ b/src/ipa/simple/algorithms/lut.cpp
+@@ -9,6 +9,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <numeric>
+ #include <optional>
+ #include <stdint.h>
+ 
+@@ -36,7 +37,7 @@ int Lut::configure(IPAContext &context,
+ {
+ 	/* Gamma value is fixed */
+ 	context.configuration.gamma = 0.5;
+-	context.activeState.knobs.contrast = std::optional<double>();
++	context.activeState.knobs.contrast = 1.2;
+ 	updateGammaTable(context);
+ 
+ 	return 0;
+@@ -141,15 +142,43 @@ void Lut::prepare(IPAContext &context,
+ 	}
+ }
+ 
+-void Lut::process([[maybe_unused]] IPAContext &context,
++void Lut::process(IPAContext &context,
+ 		  [[maybe_unused]] const uint32_t frame,
+ 		  [[maybe_unused]] IPAFrameContext &frameContext,
+-		  [[maybe_unused]] const SwIspStats *stats,
++		  const SwIspStats *stats,
+ 		  ControlList &metadata)
+ {
+-	const auto &contrast = frameContext.contrast;
+-	if (contrast)
+-		metadata.set(controls::Contrast, contrast.value());
++	/*
++	 * Adapt contrast based on scene brightness. Compute the fraction
++	 * of pixels in the top quarter of the histogram; when the scene
++	 * is mostly bright (backlit), reduce contrast and gamma lift to
++	 * avoid washing out. In normal/dark scenes, boost both.
++	 */
++	const auto &histogram = stats->yHistogram;
++	const unsigned int total =
++		std::accumulate(histogram.begin(), histogram.end(), 0u);
++	const unsigned int topQuarter = SwIspStats::kYHistogramSize / 4;
++	unsigned int brightPixels = 0;
++	for (unsigned int i = SwIspStats::kYHistogramSize - topQuarter;
++	     i < SwIspStats::kYHistogramSize; i++)
++		brightPixels += histogram[i];
++
++	const float brightFraction = total > 0
++		? static_cast<float>(brightPixels) / total : 0.0f;
++
++	/*
++	 * Map bright fraction to contrast: at 0% bright pixels use 1.3,
++	 * at 50%+ bright pixels use 1.0 (neutral). Linear interpolation.
++	 */
++	static constexpr float kContrastMax = 1.3;
++	static constexpr float kContrastMin = 1.0;
++	static constexpr float kBrightThreshold = 0.5;
++	float t = std::min(brightFraction / kBrightThreshold, 1.0f);
++	float adaptiveContrast = kContrastMax - t * (kContrastMax - kContrastMin);
++
++	context.activeState.knobs.contrast = adaptiveContrast;
++
++	metadata.set(controls::Contrast, adaptiveContrast);
+ }
+ 
+ REGISTER_IPA_ALGORITHM(Lut, "Lut")
+diff --git a/src/ipa/simple/data/meson.build b/src/ipa/simple/data/meson.build
+index 92795ee4..e6110320 100644
+--- a/src/ipa/simple/data/meson.build
++++ b/src/ipa/simple/data/meson.build
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: CC0-1.0
+ 
+ conf_files = files([
++    'ov01a10.yaml',
+     'uncalibrated.yaml',
+ ])
+ 
+diff --git a/src/libcamera/sensor/camera_sensor_properties.cpp b/src/libcamera/sensor/camera_sensor_properties.cpp
+index e2f518f9..76e2ac71 100644
+--- a/src/libcamera/sensor/camera_sensor_properties.cpp
++++ b/src/libcamera/sensor/camera_sensor_properties.cpp
+@@ -303,7 +303,20 @@ const CameraSensorProperties *CameraSensorProperties::get(const std::string &sen
+ 			},
+ 			.sensorDelays = { },
+ 		} },
+-		{ "ov2740", {
++		{ "ov01a10", {
++			.unitCellSize = { 1120, 1120 },
++			.testPatternModes = {
++				{ controls::draft::TestPatternModeOff, 0 },
++				{ controls::draft::TestPatternModeColorBars, 1 },
++			},
++			.sensorDelays = {
++				.exposureDelay = 2,
++				.gainDelay = 2,
++				.vblankDelay = 2,
++				.hblankDelay = 2
++			},
++		} },
++	{ "ov2740", {
+ 			.unitCellSize = { 1400, 1400 },
+ 			.testPatternModes = {
+ 				{ controls::draft::TestPatternModeOff, 0 },
+diff --git a/src/libcamera/stream.cpp b/src/libcamera/stream.cpp
+index 978d7275..30825730 100644
+--- a/src/libcamera/stream.cpp
++++ b/src/libcamera/stream.cpp
+@@ -136,7 +136,7 @@ std::vector<Size> StreamFormats::sizes(const PixelFormat &pixelformat) const
+ 	 * from v4l2 documentation and source code as well as lists of
+ 	 * common frame sizes.
+ 	 */
+-	static const std::array<Size, 53> rangeDiscreteSizes = {
++	static const std::array<Size, 54> rangeDiscreteSizes = {
+ 		Size(160, 120),
+ 		Size(240, 160),
+ 		Size(320, 240),
+@@ -154,6 +154,7 @@ std::vector<Size> StreamFormats::sizes(const PixelFormat &pixelformat) const
+ 		Size(1024, 576),
+ 		Size(1024, 600),
+ 		Size(1024, 768),
++		Size(1268, 800),
+ 		Size(1152, 864),
+ 		Size(1280, 1024),
+ 		Size(1280, 1080),
