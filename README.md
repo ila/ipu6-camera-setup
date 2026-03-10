@@ -118,6 +118,17 @@ qcam
 gst-launch-1.0 libcamerasrc ! videoconvert ! autovideosink
 ```
 
+## Tuning the Color Correction Matrix
+
+The tuning file `patches/ov01a10.yaml` controls color correction (CCM), black level, and other ISP parameters. If you edit it after installation, you must copy it to the installed location and restart PipeWire:
+
+```bash
+sudo cp patches/ov01a10.yaml /usr/share/libcamera/ipa/simple/ov01a10.yaml
+systemctl --user restart pipewire wireplumber
+```
+
+Changes won't take effect until the file is copied — libcamera reads from `/usr/share/`, not from the source tree.
+
 ## Notes
 
 - The ov01a10 is a 1.3MP fixed-focus sensor. Image quality is limited by hardware.
